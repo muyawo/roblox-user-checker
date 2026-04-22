@@ -9,7 +9,7 @@ make a **REASONABLE** sized list of usernames in usernames.txt. if its too large
 make sure you have python installed from the official website! no extra packages are needed for this script
 <br/>
 <br/>
-___how to run___
+___how to run___:
 
 it should work with any command center you use, but i've only tested with windows powershell. 
 
