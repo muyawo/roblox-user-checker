@@ -1,0 +1,266 @@
+import argparse
+import csv
+import json
+import re
+import socket
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+USER_LOOKUP_URL = "https://users.roblox.com/v1/usernames/users"
+USER_AGENT = "roblox-username-checker/2.0"
+DEFAULT_TIMEOUT = 10.0
+DEFAULT_BATCH_SIZE = 100
+USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,20}$")
+
+
+class RobloxLookupError(RuntimeError):
+    """raised when the rblx lookup API cannot be reached"""
+
+
+class UsernameResult:
+    def __init__(self, username, status, detail, user_id=""):
+        self.username = username
+        self.status = status
+        self.detail = detail
+        self.user_id = user_id
+
+
+def read_usernames(path):
+    usernames = []
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        usernames.append(line)
+    return usernames
+
+
+def validate_username_format(username):
+    if len(username) < 3 or len(username) > 20:
+        return "invalid"
+
+    if not USERNAME_RE.fullmatch(username):
+        return "invalid"
+
+    if username.count("_") > 1:
+        return "invalid"
+
+    if username.startswith("_") or username.endswith("_"):
+        return "invalid"
+
+    return None
+
+
+def chunked(items, size):
+    return [items[index : index + size] for index in range(0, len(items), size)]
+
+
+def post_json(url, payload, timeout):
+    body = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        raise RobloxLookupError("roblox returned HTTP {}: {}".format(exc.code, raw))
+    except (urllib.error.URLError, socket.timeout, TimeoutError) as exc:
+        raise RobloxLookupError(
+            "couldnt connect 2 roblox API at {}. {}".format(url, exc)
+        )
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RobloxLookupError("roblox returned invalid JSON: {!r}".format(raw[:200]))
+
+    if not isinstance(data, dict):
+        raise RobloxLookupError("unexpected roblox response: {!r}".format(data))
+
+    return data
+
+
+def lookup_taken_usernames(usernames, timeout, batch_size):
+    taken = {}
+
+    for batch in chunked(usernames, batch_size):
+        response = post_json(
+            USER_LOOKUP_URL,
+            {
+                "usernames": batch,
+                "excludeBannedUsers": False,
+            },
+            timeout,
+        )
+
+        data = response.get("data")
+        if not isinstance(data, list):
+            raise RobloxLookupError("Unexpected Roblox response shape: {!r}".format(response))
+
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+
+            requested = item.get("requestedUsername")
+            if isinstance(requested, str) and requested.strip():
+                taken[requested.casefold()] = item
+
+    return taken
+
+
+def check_usernames(usernames, timeout, batch_size):
+    valid_names = []
+    precomputed = {}
+
+    for username in usernames:
+        format_error = validate_username_format(username)
+        if format_error is not None:
+            precomputed[username.casefold()] = UsernameResult(
+                username=username,
+                status="invalid",
+                detail=format_error,
+            )
+        else:
+            valid_names.append(username)
+
+    taken_lookup = lookup_taken_usernames(list(dict.fromkeys(valid_names)), timeout, batch_size)
+
+    results = []
+    for username in usernames:
+        cached = precomputed.get(username.casefold())
+        if cached is not None:
+            results.append(cached)
+            continue
+
+        item = taken_lookup.get(username.casefold())
+        if item is not None:
+            user_id = str(item.get("id", ""))
+            actual_name = item.get("name")
+            detail = "Taken"
+            if isinstance(actual_name, str) and actual_name:
+                detail = "username taken {}".format(actual_name)
+            results.append(
+                UsernameResult(
+                    username=username,
+                    status="taken",
+                    detail=detail,
+                    user_id=user_id,
+                )
+            )
+        else:
+            results.append(
+                UsernameResult(
+                    username=username,
+                    status="available",
+                    detail="Not returned by Roblox user lookup.",
+                )
+            )
+
+    return results
+
+
+def print_results(results):
+    if not results:
+        print("no usernames in file! read the readme file for specifics")
+        return
+
+    username_width = max(len("Username"), *(len(item.username) for item in results))
+    status_width = max(len("Status"), *(len(item.status) for item in results))
+
+    header = "{:<{}}  {:<{}}  Detail".format("Username", username_width, "Status", status_width)
+    print(header)
+    print("-" * len(header))
+
+    for item in results:
+        print(
+            "{:<{}}  {:<{}}  {}".format(
+                item.username,
+                username_width,
+                item.status,
+                status_width,
+                item.detail,
+            )
+        )
+
+
+def write_csv(path, results):
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["username", "status", "detail", "user_id"])
+        writer.writeheader()
+        for item in results:
+            writer.writerow(
+                {
+                    "username": item.username,
+                    "status": item.status,
+                    "detail": item.detail,
+                    "user_id": item.user_id,
+                }
+            )
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description="Check Roblox username availability from a text file.")
+    parser.add_argument("input_file", type=Path, help="Path to a .txt file with one username per line.")
+    parser.add_argument("--csv", dest="csv_path", type=Path, help="Optional CSV output path.")
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_TIMEOUT,
+        help="HTTP timeout in seconds. default: {}".format(DEFAULT_TIMEOUT),
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=DEFAULT_BATCH_SIZE,
+        help="how many usernames to send per request? default: {}".format(DEFAULT_BATCH_SIZE),
+    )
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
+
+    if not args.input_file.exists():
+        print("input file not found: {}".format(args.input_file), file=sys.stderr)
+        return 1
+
+    if args.batch_size <= 0:
+        print("batch size too small stawppp.", file=sys.stderr)
+        return 1
+
+    usernames = read_usernames(args.input_file)
+
+    try:
+        results = check_usernames(usernames, args.timeout, args.batch_size)
+    except RobloxLookupError as exc:
+        print("you did everything correct with the script, but your device isn't able to connect to roblox!", file=sys.stderr)
+        print("Error: {}".format(exc), file=sys.stderr)
+        print(
+            "if this keeps happening, just know this file has nothing to do with it. restarting ur router might help :-)",
+            file=sys.stderr,
+        )
+        return 2
+
+    print_results(results)
+
+    if args.csv_path is not None:
+        write_csv(args.csv_path, results)
+        print("\nSaved CSV results to {}".format(args.csv_path))
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
